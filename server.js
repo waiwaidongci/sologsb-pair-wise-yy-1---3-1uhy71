@@ -126,14 +126,53 @@ function latestAdjustment(db, clockId) {
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] || null;
 }
 
+const AMPLITUDE_MIN = 180;
+const AMPLITUDE_MAX = 320;
+
+function badRequest(message) {
+  const error = new Error(message);
+  error.status = 400;
+  return error;
+}
+
+// 复测指标是否达标：日差绝对值不高于目标值，且振幅在 180–320（含边界）
+function retestMeetsTarget(clock, retest) {
+  const dailyRate = Number(retest.dailyRateSeconds);
+  const amplitude = Number(retest.amplitude);
+  return (
+    Math.abs(dailyRate) <= Number(clock.targetDailyRateSeconds)
+    && amplitude >= AMPLITUDE_MIN
+    && amplitude <= AMPLITUDE_MAX
+  );
+}
+
+// 调校后复测闸门（唯一结论口径）：
+// 复测必须关联“当前最新调校”、发生在该调校之后，且指标达标，才算合格。
+// 旧调校名下的合格复测不会覆盖新调校。
+function retestQualifies(db, clock, retest, latest = latestAdjustment(db, clock.id)) {
+  if (!latest) return false;
+  if (retest.clockId !== clock.id || retest.adjustmentId !== latest.id) return false;
+  if (new Date(retest.testedAt).getTime() < new Date(latest.createdAt).getTime()) return false;
+  return retestMeetsTarget(clock, retest);
+}
+
+function clockQualified(db, clock) {
+  const latest = latestAdjustment(db, clock.id);
+  return Boolean(latest) && db.retests.some((retest) => retestQualifies(db, clock, retest, latest));
+}
+
+// 复测的 qualified 一律按当前闸门实时计算，不信任历史落库值，保证各接口口径一致
+function decorateRetest(db, clock, retest) {
+  if (!retest) return null;
+  return { ...retest, qualified: retestQualifies(db, clock, retest) };
+}
+
 function clockSummary(db, clock) {
-  const retest = latestRetest(db, clock.id);
-  const adjustment = latestAdjustment(db, clock.id);
   return {
     ...clock,
-    latestAdjustment: adjustment,
-    latestRetest: retest,
-    qualified: retest ? retest.qualified : false
+    latestAdjustment: latestAdjustment(db, clock.id),
+    latestRetest: decorateRetest(db, clock, latestRetest(db, clock.id)),
+    qualified: clockQualified(db, clock)
   };
 }
 
@@ -182,8 +221,20 @@ async function handle(req, res) {
   if (historyMatch && req.method === "GET") {
     const clock = findClock(db, historyMatch[1]);
     const adjustments = db.adjustments.filter((item) => item.clockId === clock.id);
-    const retests = db.retests.filter((item) => item.clockId === clock.id);
-    return send(res, 200, { data: { clock, adjustments, retests, latestRetest: latestRetest(db, clock.id) } });
+    const retests = db.retests
+      .filter((item) => item.clockId === clock.id)
+      .map((retest) => decorateRetest(db, clock, retest));
+    const summary = clockSummary(db, clock);
+    return send(res, 200, {
+      data: {
+        clock,
+        adjustments,
+        retests,
+        latestAdjustment: summary.latestAdjustment,
+        latestRetest: summary.latestRetest,
+        qualified: summary.qualified
+      }
+    });
   }
 
   const adjustmentMatch = pathname.match(/^\/clocks\/([^/]+)\/adjustments$/);
@@ -210,20 +261,36 @@ async function handle(req, res) {
     const clock = findClock(db, retestMatch[1]);
     const body = await parseBody(req);
     required(body, ["dailyRateSeconds", "amplitude"]);
-    const adjustmentId = body.adjustmentId || latestAdjustment(db, clock.id)?.id || null;
-    const qualified = body.qualified !== undefined
-      ? Boolean(body.qualified)
-      : Math.abs(Number(body.dailyRateSeconds)) <= Number(clock.targetDailyRateSeconds);
+    const dailyRateSeconds = Number(body.dailyRateSeconds);
+    const amplitude = Number(body.amplitude);
+    if (!Number.isFinite(dailyRateSeconds)) throw badRequest("dailyRateSeconds 必须是数字");
+    if (!Number.isFinite(amplitude)) throw badRequest("amplitude 必须是数字");
+    const testedAt = body.testedAt || new Date().toISOString();
+    if (Number.isNaN(new Date(testedAt).getTime())) throw badRequest("testedAt 必须是合法时间");
+
+    // 复测绑定的调校必须属于当前钟表；绑定其他钟表的调校返回 400
+    let adjustment;
+    if (body.adjustmentId) {
+      adjustment = db.adjustments.find((item) => item.id === body.adjustmentId);
+      if (!adjustment) throw badRequest("关联的调校不存在");
+      if (adjustment.clockId !== clock.id) throw badRequest("复测只能关联当前钟表的调校");
+    } else {
+      adjustment = latestAdjustment(db, clock.id);
+    }
+
+    // 结论由服务端按“当前最新调校”闸门计算，请求方传 qualified 一律忽略；
+    // 未达标复测或绑定旧调校的复测仍落库，但结论为不合格
     const retest = {
       id: makeId("retest"),
       clockId: clock.id,
-      adjustmentId,
-      testedAt: body.testedAt || new Date().toISOString(),
-      dailyRateSeconds: Number(body.dailyRateSeconds),
-      amplitude: Number(body.amplitude),
-      qualified,
+      adjustmentId: adjustment ? adjustment.id : null,
+      testedAt,
+      dailyRateSeconds,
+      amplitude,
+      qualified: false,
       note: body.note || ""
     };
+    retest.qualified = retestQualifies(db, clock, retest);
     db.retests.push(retest);
     await writeDb(db);
     return send(res, 201, { data: retest, clock: clockSummary(db, clock) });
@@ -231,8 +298,10 @@ async function handle(req, res) {
 
   const latestMatch = pathname.match(/^\/clocks\/([^/]+)\/latest-retest$/);
   if (latestMatch && req.method === "GET") {
-    findClock(db, latestMatch[1]);
-    return send(res, 200, { data: latestRetest(db, latestMatch[1]) });
+    const clock = findClock(db, latestMatch[1]);
+    const retest = decorateRetest(db, clock, latestRetest(db, clock.id));
+    // 顶层 qualified 与 /clocks、/history 共用同一闸门结论
+    return send(res, 200, { data: retest, qualified: clockQualified(db, clock) });
   }
 
   if (req.method === "GET" && pathname === "/adjustments") {
@@ -243,11 +312,15 @@ async function handle(req, res) {
   if (req.method === "GET" && pathname === "/retests") {
     const clockId = url.searchParams.get("clockId");
     const qualified = url.searchParams.get("qualified");
-    const data = db.retests.filter((item) => {
-      const matchClock = !clockId || item.clockId === clockId;
-      const matchQualified = qualified === null || item.qualified === (qualified === "true");
-      return matchClock && matchQualified;
-    });
+    let data = db.retests
+      .filter((item) => !clockId || item.clockId === clockId)
+      .map((item) => {
+        const clock = db.clocks.find((candidate) => candidate.id === item.clockId);
+        return clock ? decorateRetest(db, clock, item) : { ...item, qualified: false };
+      });
+    if (qualified !== null) {
+      data = data.filter((item) => item.qualified === (qualified === "true"));
+    }
     return send(res, 200, { data });
   }
 
